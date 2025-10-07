@@ -15,7 +15,6 @@ from config import get_s3_storage_client, get_jwt_auth_manager
 from validation import validate_name, validate_birth_date, validate_image, validate_gender
 from exceptions import InvalidTokenError, TokenExpiredError
 
-
 router = APIRouter()
 
 
@@ -99,17 +98,17 @@ async def create_profile(db, s3_client, user_id, avatar, **data):
     status_code=status.HTTP_201_CREATED
 )
 async def create_user_profile(
-    user_id: int,
-    request: Request,
-    first_name: str = Form(...),
-    last_name: str = Form(...),
-    gender: Optional[str] = Form(None),
-    date_of_birth: Optional[date] = Form(None),
-    info: str = Form(...),
-    avatar: Optional[UploadFile] = File(None),
-    db: AsyncSession = Depends(get_db),
-    s3_client: S3StorageInterface = Depends(get_s3_storage_client),
-    jwt_manager: JWTAuthManagerInterface = Depends(get_jwt_auth_manager),
+        user_id: int,
+        request: Request,
+        first_name: str = Form(...),
+        last_name: str = Form(...),
+        gender: Optional[str] = Form(None),
+        date_of_birth: Optional[date] = Form(None),
+        info: str = Form(...),
+        avatar: Optional[UploadFile] = File(None),
+        db: AsyncSession = Depends(get_db),
+        s3_client: S3StorageInterface = Depends(get_s3_storage_client),
+        jwt_manager: JWTAuthManagerInterface = Depends(get_jwt_auth_manager),
 ):
     await authorize_user(
         request,

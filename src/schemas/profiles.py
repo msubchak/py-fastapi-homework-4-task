@@ -3,7 +3,7 @@ from typing import Optional
 from pydantic import BaseModel, Field, field_validator
 from pydantic import ConfigDict
 
-from src.validation import validate_name, validate_gender, validate_birth_date
+from validation import validate_name, validate_gender, validate_birth_date
 
 
 class ProfileCreateSchema(BaseModel):

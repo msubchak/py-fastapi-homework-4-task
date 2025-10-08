@@ -1,75 +1,103 @@
 from datetime import date
 from typing import Optional
 
-from fastapi import APIRouter, Depends, HTTPException, status, Form, File, UploadFile, Request
+from fastapi import APIRouter, Depends, HTTPException, status, Form, File, UploadFile
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.future import select
-from sqlalchemy.orm import selectinload
 
 from database import get_db
-from database.models.accounts import UserModel, UserProfileModel, UserGroupEnum
+from database.models.accounts import UserModel, UserProfileModel, UserGroupEnum, UserGroupModel
 from schemas.profiles import ProfileResponseSchema
 from storages import S3StorageInterface
 from security.interfaces import JWTAuthManagerInterface
 from config import get_s3_storage_client, get_jwt_auth_manager
-from validation import validate_name, validate_birth_date, validate_image, validate_gender
+from security.http import get_token
+from validation import validate_name, validate_birth_date, validate_image, validate_gender, validate_info
 from exceptions import InvalidTokenError, TokenExpiredError
+
 
 router = APIRouter()
 
 
-async def authorize_user(request, jwt_manager, db, user_id):
-    auth_header = request.headers.get("Authorization")
-    if not auth_header:
-        raise HTTPException(status_code=401, detail="Authorization header is missing")
-    if not auth_header.startswith("Bearer "):
-        raise HTTPException(
-            status_code=401,
-            detail="Invalid Authorization header format. Expected 'Bearer <token>'"
-        )
-    token = auth_header.split(" ")[1]
-
+async def authorize_user(
+        token: str,
+        db: AsyncSession,
+        user_id: int,
+        jwt_manager: JWTAuthManagerInterface
+):
     try:
         payload = jwt_manager.decode_access_token(token)
-    except (InvalidTokenError, TokenExpiredError):
-        raise HTTPException(status_code=401, detail="Invalid or expired token.")
+        token_user_id = payload.get("user_id")
+        if not token_user_id or not isinstance(token_user_id, int):
+            raise HTTPException(
+                status_code=status.HTTP_401_UNAUTHORIZED,
+                detail="Invalid or missing user_id in token."
+            )
+    except TokenExpiredError:
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Token has expired.")
+    except InvalidTokenError:
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid token.")
+    if user_id != token_user_id:
+        result_user_group = await db.execute(
+            select(UserGroupModel).join(UserModel).where(UserModel.id == token_user_id)
+        )
+        user_group = result_user_group.scalar_one_or_none()
+        if not user_group or user_group.name == UserGroupEnum.USER:
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail="You don't have permission to edit this profile."
+            )
 
-    current_user_id = payload.get("user_id")
-    if current_user_id is None:
-        raise HTTPException(status_code=401, detail="Invalid or expired token.")
 
-    stmt = select(UserModel).where(UserModel.id == current_user_id).options(selectinload(UserModel.group))
-    current_user = (await db.execute(stmt)).scalar_one_or_none()
-    if not current_user or not current_user.is_active:
-        raise HTTPException(status_code=401, detail="User not found or not active.")
-
-    if current_user_id != user_id and (not current_user.group or current_user.group.name != UserGroupEnum.ADMIN):
-        raise HTTPException(status_code=403, detail="You don't have permission to edit this profile.")
-
-    return current_user
-
-
-def validate_profile_data(first_name, last_name, gender, date_of_birth, info):
+def validate_profile_data(
+        first_name,
+        last_name,
+        gender,
+        date_of_birth,
+        info
+):
     try:
         first_name = validate_name(first_name)
-        last_name = validate_name(last_name)
-        if not first_name or not last_name:
-            raise ValueError("Invalid first or last name")
-
-        first_name = first_name.lower()
-        last_name = last_name.lower()
-
-        if gender:
-            gender = validate_gender(gender)
-        if date_of_birth:
-            date_of_birth = validate_birth_date(date_of_birth)
-        if not info.strip():
-            raise ValueError("Info field cannot be empty or contain only spaces.")
     except ValueError as e:
         raise HTTPException(status_code=422, detail=str(e))
+    try:
+        last_name = validate_name(last_name)
+    except ValueError as e:
+        raise HTTPException(status_code=422, detail=str(e))
+    if not info.strip():
+        raise HTTPException(status_code=422, detail="Info field cannot be empty or contain only spaces.")
+    validated_data = {
+        "first_name": first_name.lower() if first_name else "",
+        "last_name": last_name.lower() if last_name else "",
+        "info": info
+    }
+    if gender is not None:
+        try:
+            validated_data["gender"] = validate_gender(gender)
+        except ValueError as e:
+            raise HTTPException(status_code=422, detail=str(e))
+    else:
+        validated_data["gender"] = None
+    if date_of_birth is not None:
+        try:
+            validated_data["date_of_birth"] = validate_birth_date(date_of_birth)
+        except ValueError as e:
+            raise HTTPException(status_code=422, detail=str(e))
+    else:
+        validated_data["date_of_birth"] = None
+    return validated_data
 
 
-async def create_profile(db, s3_client, user_id, avatar, **data):
+async def create_profile(
+        db: AsyncSession,
+        s3_client: S3StorageInterface,
+        user_id: int,
+        avatar: Optional[UploadFile],
+        **data
+):
+    existing = await db.execute(select(UserProfileModel).where(UserProfileModel.user_id == user_id))
+    if existing.scalar_one_or_none():
+        raise HTTPException(status_code=400, detail="User already has a profile.")
     profile = UserProfileModel(user_id=user_id, **data)
     if avatar:
         try:
@@ -82,24 +110,19 @@ async def create_profile(db, s3_client, user_id, avatar, **data):
         except ValueError as e:
             raise HTTPException(status_code=422, detail=str(e))
         except Exception:
-            raise HTTPException(status_code=500, detail="Failed to upload avatar.")
+            raise HTTPException(status_code=500, detail="Failed to upload avatar. Please try again later.")
     db.add(profile)
     await db.commit()
     await db.refresh(profile)
     avatar_url = await s3_client.get_file_url(profile.avatar) if profile.avatar else None
-    response = ProfileResponseSchema.from_orm(profile)
+    response = ProfileResponseSchema.model_validate(profile)
     response.avatar = avatar_url
     return response
 
 
-@router.post(
-    "/users/{user_id}/profile/",
-    response_model=ProfileResponseSchema,
-    status_code=status.HTTP_201_CREATED
-)
+@router.post("/users/{user_id}/profile/", response_model=ProfileResponseSchema, status_code=status.HTTP_201_CREATED)
 async def create_user_profile(
         user_id: int,
-        request: Request,
         first_name: str = Form(...),
         last_name: str = Form(...),
         gender: Optional[str] = Form(None),
@@ -109,13 +132,10 @@ async def create_user_profile(
         db: AsyncSession = Depends(get_db),
         s3_client: S3StorageInterface = Depends(get_s3_storage_client),
         jwt_manager: JWTAuthManagerInterface = Depends(get_jwt_auth_manager),
+        token: str = Depends(get_token),
 ):
-    await authorize_user(
-        request,
-        jwt_manager,
-        db,
-        user_id
-    )
+    await authorize_user(token, db, user_id, jwt_manager)
+
     validated_data = validate_profile_data(
         first_name,
         last_name,
@@ -123,11 +143,18 @@ async def create_user_profile(
         date_of_birth,
         info
     )
-    profile = await create_profile(
-        db,
-        s3_client,
-        user_id,
-        avatar,
-        **validated_data
-    )
+
+    if avatar:
+        try:
+            validate_image(avatar)
+        except ValueError as e:
+            raise HTTPException(status_code=422, detail=str(e))
+
+    stmt = select(UserModel).where(UserModel.id == user_id)
+    result = await db.execute(stmt)
+    user = result.scalar_one_or_none()
+    if not user or not user.is_active:
+        raise HTTPException(status_code=401, detail="User not found or not active.")
+
+    profile = await create_profile(db, s3_client, user_id, avatar, **validated_data)
     return profile
